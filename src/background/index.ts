@@ -1,9 +1,9 @@
 import { Connection, PublicKey } from "@solana/web3.js"
 
-import { getAutoLockMinutes, getStoredWallet, isWalletLocked, setLockState } from "~lib/storage/secure"
+import { getAutoLockMinutes, getNetwork, getStoredWallet, isWalletLocked, setLockState } from "~lib/storage/secure"
 import { addApprovedOrigin, isOriginApproved, removeApprovedOrigin } from "~lib/storage/connections"
 import { clearSession, getLastActivity, loadSession, recordActivity } from "~lib/storage/session"
-import { addNote, getNotes, markNoteSpentByCommitment, shieldedBalance, shieldedTokenBalances, type ShieldedNote } from "~lib/paraloom/notes"
+import { addNote, getNotes, markNoteSpentByCommitment, shieldedBalance, shieldedTokenBalances, type NoteNetwork, type ShieldedNote } from "~lib/paraloom/notes"
 import { scanForNotes } from "~lib/paraloom/scan"
 import {
   associatedTokenAddress,
@@ -640,8 +640,9 @@ async function handleShieldedBalance(sender: chrome.runtime.MessageSender) {
   // MV3 service worker to be evicted mid-handler, so the page's read never
   // resolved ("trying to load but can't"). Scan in the BACKGROUND instead; the
   // next read picks up any newly discovered transfer notes.
-  void backgroundScan(session, addr)
-  const bal = await shieldedBalance(addr)
+  const network = await getNetwork()
+  void backgroundScan(session, addr, network)
+  const bal = await shieldedBalance(addr, network)
   return { lamports: bal.toString() }
 }
 
@@ -650,7 +651,8 @@ async function handleShieldedBalance(sender: chrome.runtime.MessageSender) {
 let scanInFlight = false
 async function backgroundScan(
   session: Awaited<ReturnType<typeof loadSession>>,
-  addr: string
+  addr: string,
+  network: NoteNetwork = "mainnet-beta"
 ): Promise<void> {
   if (scanInFlight || !session) return
   scanInFlight = true
@@ -658,7 +660,8 @@ async function backgroundScan(
     await scanForNotes(
       addr,
       session.wallet.boxSecretKey,
-      Buffer.from(session.wallet.spendPrivkey).toString("hex")
+      Buffer.from(session.wallet.spendPrivkey).toString("hex"),
+      network
     )
   } catch {
     // node down / no scan endpoint — the local balance still stands
@@ -676,12 +679,13 @@ async function handleShieldedTokenBalances(sender: chrome.runtime.MessageSender)
   if (!session) return { balances: {} }
 
   const addr = session.wallet.shieldedAddress
+  const network = await getNetwork()
   // Same as the native balance: return the LOCAL token balances immediately and
   // scan in the background, so a slow scan can never evict the worker before the
   // page's read resolves. Re-shielded USDC is a local deposit note, so it shows
   // without waiting on the scan at all.
-  void backgroundScan(session, addr)
-  const balances = await shieldedTokenBalances(addr)
+  void backgroundScan(session, addr, network)
+  const balances = await shieldedTokenBalances(addr, network)
   const out: Record<string, string> = {}
   for (const [mint, amount] of Object.entries(balances)) out[mint] = amount.toString()
   return { balances: out }
@@ -803,29 +807,31 @@ async function runSwapJob(
 async function dropPhantomNotes(
   connection: Connection,
   account: string,
-  notes: ShieldedNote[]
+  notes: ShieldedNote[],
+  network: NoteNetwork = "mainnet-beta"
 ): Promise<ShieldedNote[]> {
   const GRACE_MS = 120_000
-  const suspects = notes.filter(
+  const clusterNotes = notes.filter((n) => (n.network ?? "mainnet-beta") === network)
+  const suspects = clusterNotes.filter(
     (n) =>
       n.leafIndex === undefined &&
       !!n.commitment &&
       Date.now() - n.createdAt > GRACE_MS
   )
-  if (suspects.length === 0) return notes
+  if (suspects.length === 0) return clusterNotes
 
   let onchain: Set<string>
   try {
     const leaves = await fetchV3Leaves(connection)
     onchain = new Set(leaves.map((l) => l.commitmentHex))
   } catch {
-    return notes // cannot rebuild the tree safely — drop nothing
+    return clusterNotes // cannot rebuild the tree safely — drop nothing
   }
 
   const dropped = new Set<string>()
   for (const n of suspects) {
     if (n.commitment && !onchain.has(n.commitment)) {
-      await markNoteSpentByCommitment(account, n.commitment)
+      await markNoteSpentByCommitment(account, n.commitment, network)
       dropped.add(n.commitment)
     }
   }
@@ -834,7 +840,7 @@ async function dropPhantomNotes(
       `[paraloom] reconciled ${dropped.size} phantom note(s) not present on-chain`
     )
   }
-  return notes.filter((n) => !(n.commitment && dropped.has(n.commitment)))
+  return clusterNotes.filter((n) => !(n.commitment && dropped.has(n.commitment)))
 }
 
 // The actual spend. Runs only after handlePrivateSwapRequest approved it.
@@ -868,7 +874,7 @@ async function handlePrivateSwap(
     const inputAssetId = await assetIdForMint(
       new PublicKey(params.inputMint).toBuffer().toString("hex")
     )
-    const allNotes = await getNotes(shieldedAddress)
+    const allNotes = await getNotes(shieldedAddress, "mainnet-beta")
     const tokenCandidates = allNotes.filter(
       (n) => !n.spent && n.assetId === inputAssetId
     )
@@ -922,7 +928,7 @@ async function handlePrivateSwap(
     }
   }
 
-  const candidates = (await getNotes(shieldedAddress)).filter(
+  const candidates = (await getNotes(shieldedAddress, "mainnet-beta")).filter(
     (n) => !n.spent && n.assetId === NATIVE_ASSET_HEX
   )
   // Reconcile out phantom notes (leftovers from swaps that never settled)

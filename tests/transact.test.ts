@@ -205,6 +205,43 @@ describe("event attribution", () => {
     ])
     expect(await fetchV3Leaves(connection)).toHaveLength(1)
   })
+  it("ignores events emitted inside an inner CPI frame that subsequently fails or is truncated", async () => {
+    const { connection } = fakeConnection([
+      {
+        logs: [
+          `Program ${OTHER_PROGRAM} invoke [1]`,
+          `Program ${PROGRAM_ID} invoke [2]`,
+          `Program data: ${depositEvent(0xff, 1)}`,
+          `Program ${PROGRAM_ID} failed: custom program error: 0x1`,
+          `Program ${OTHER_PROGRAM} success`
+        ]
+      },
+      { logs: emittedBy(PROGRAM_ID, depositEvent(0xa0, 0)) }
+    ])
+    const leaves = await fetchV3Leaves(connection)
+    expect(leaves).toHaveLength(1)
+    expect(leaves[0].commitmentHex).toBe("a0".repeat(32))
+  })
+
+  it("does not pop our program frame on a spoofed or mismatched exit log line", async () => {
+    const { connection } = fakeConnection([
+      {
+        logs: [
+          `Program ${PROGRAM_ID} invoke [1]`,
+          `Program ${OTHER_PROGRAM} invoke [2]`,
+          `Program ${PROGRAM_ID} success`,
+          `Program data: ${depositEvent(0xff, 1)}`,
+          `Program ${OTHER_PROGRAM} success`,
+          `Program data: ${depositEvent(0xa0, 0)}`,
+          `Program ${PROGRAM_ID} success`
+        ]
+      }
+    ])
+    const leaves = await fetchV3Leaves(connection)
+    expect(leaves).toHaveLength(1)
+    expect(leaves[0].commitmentHex).toBe("a0".repeat(32))
+  })
+
 })
 
 describe("SPL deposits share the tree (#779)", () => {
@@ -271,6 +308,7 @@ describe("SPL deposits share the tree (#779)", () => {
     ])
     expect(await fetchV3Leaves(connection)).toHaveLength(1)
   })
+
 })
 
 describe("transact outputs", () => {

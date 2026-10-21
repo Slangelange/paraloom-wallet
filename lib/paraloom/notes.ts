@@ -3,6 +3,10 @@
 // shielded balance is tracked here: the sum of unspent deposits. Each note
 // keeps the randomness needed to spend it in a later withdrawal.
 
+export type NoteNetwork = "mainnet-beta" | "devnet"
+
+export const DEFAULT_NOTE_NETWORK: NoteNetwork = "mainnet-beta"
+
 // Spend-key note (circuit v2, #293). The note is bound to the account's spend
 // public key (derived from the account seed, not stored here); to spend it the
 // wallet supplies that account spend privkey plus this note's `blinding`. The
@@ -27,6 +31,13 @@ export interface ShieldedNote {
   // recorded at deposit (from DepositNoteEvent) or located by commitment for
   // received notes. Spending needs it for the membership path.
   leafIndex?: number
+  // Solana cluster whose on-chain incremental Merkle tree holds this note.
+  // Legacy notes stored before cluster tagging default to "mainnet-beta".
+  network?: NoteNetwork
+}
+
+export function noteNetwork(note: Pick<ShieldedNote, "network">): NoteNetwork {
+  return note.network ?? DEFAULT_NOTE_NETWORK
 }
 
 const NOTES_KEY = "paraloom_notes"
@@ -42,43 +53,71 @@ async function writeAll(all: NotesByAccount): Promise<void> {
   await chrome.storage.local.set({ [NOTES_KEY]: all })
 }
 
-export async function getNotes(account: string): Promise<ShieldedNote[]> {
+export async function getNotes(
+  account: string,
+  network: NoteNetwork = DEFAULT_NOTE_NETWORK
+): Promise<ShieldedNote[]> {
   const all = await readAll()
-  return all[account] ?? []
+  return (all[account] ?? []).filter((n) => noteNetwork(n) === network)
 }
 
-export async function addNote(account: string, note: ShieldedNote): Promise<void> {
+export async function addNote(
+  account: string,
+  note: ShieldedNote,
+  network?: NoteNetwork
+): Promise<void> {
   const all = await readAll()
   const existing = all[account] ?? []
-  // Idempotent by (non-empty) deposit signature: the same shielded note can be
-  // persisted more than once — the early on-submit persist AND the end-of-flow
-  // persist AND the recovery scan all target the same deposit — so dedupe here
-  // rather than double-counting the balance.
-  if (note.signature && existing.some((n) => n.signature === note.signature)) {
+  const net = network ?? noteNetwork(note)
+  const stored = network && !note.network ? { ...note, network } : note
+  // Idempotent by (non-empty) deposit signature within the same cluster: the
+  // same shielded note can be persisted more than once — the early on-submit
+  // persist AND the end-of-flow persist AND the recovery scan all target the
+  // same deposit — so dedupe here rather than double-counting the balance.
+  if (
+    stored.signature &&
+    existing.some((n) => noteNetwork(n) === net && n.signature === stored.signature)
+  ) {
     return
   }
-  all[account] = [...existing, note]
+  all[account] = [...existing, stored]
   await writeAll(all)
 }
 
 // Mark the note with this deposit signature as spent (after a withdrawal
 // settles), so it no longer counts toward the shielded balance.
-export async function markNoteSpent(account: string, signature: string): Promise<void> {
+export async function markNoteSpent(
+  account: string,
+  signature: string,
+  network: NoteNetwork = DEFAULT_NOTE_NETWORK
+): Promise<void> {
   const all = await readAll()
   const notes = all[account] ?? []
-  all[account] = notes.map((n) => (n.signature === signature ? { ...n, spent: true } : n))
+  all[account] = notes.map((n) =>
+    noteNetwork(n) === network && n.signature === signature ? { ...n, spent: true } : n
+  )
   await writeAll(all)
 }
 
 // Add a note discovered by scanning transfer ciphertexts (#196), de-duplicated
-// by commitment so re-scanning is idempotent.
-export async function addDiscoveredNote(account: string, note: ShieldedNote): Promise<void> {
+// by commitment within the same cluster so re-scanning is idempotent.
+export async function addDiscoveredNote(
+  account: string,
+  note: ShieldedNote,
+  network?: NoteNetwork
+): Promise<void> {
   const all = await readAll()
   const notes = all[account] ?? []
-  if (notes.some((n) => n.commitment && n.commitment === note.commitment)) {
+  const net = network ?? noteNetwork(note)
+  const stored = network && !note.network ? { ...note, network } : note
+  if (
+    notes.some(
+      (n) => noteNetwork(n) === net && n.commitment && n.commitment === stored.commitment
+    )
+  ) {
     return
   }
-  all[account] = [...notes, note]
+  all[account] = [...notes, stored]
   await writeAll(all)
 }
 
@@ -89,13 +128,14 @@ export async function addDiscoveredNote(account: string, note: ShieldedNote): Pr
 export async function setNoteLeafIndex(
   account: string,
   commitment: string,
-  leafIndex: number
+  leafIndex: number,
+  network: NoteNetwork = DEFAULT_NOTE_NETWORK
 ): Promise<void> {
   const all = await readAll()
   const notes = all[account] ?? []
   let changed = false
   all[account] = notes.map((n) => {
-    if (n.commitment === commitment && n.leafIndex !== leafIndex) {
+    if (noteNetwork(n) === network && n.commitment === commitment && n.leafIndex !== leafIndex) {
       changed = true
       return { ...n, leafIndex }
     }
@@ -106,10 +146,16 @@ export async function setNoteLeafIndex(
 
 // Mark a note spent by its commitment (used for transfer inputs/outputs, which
 // are identified by commitment rather than a deposit signature).
-export async function markNoteSpentByCommitment(account: string, commitment: string): Promise<void> {
+export async function markNoteSpentByCommitment(
+  account: string,
+  commitment: string,
+  network: NoteNetwork = DEFAULT_NOTE_NETWORK
+): Promise<void> {
   const all = await readAll()
   const notes = all[account] ?? []
-  all[account] = notes.map((n) => (n.commitment === commitment ? { ...n, spent: true } : n))
+  all[account] = notes.map((n) =>
+    noteNetwork(n) === network && n.commitment === commitment ? { ...n, spent: true } : n
+  )
   await writeAll(all)
 }
 
@@ -119,11 +165,16 @@ export async function markNoteSpentByCommitment(account: string, commitment: str
 // Matching on `signature` alone flips every empty-signature note at once —
 // received and change notes vanish from the balance and re-scan does not bring
 // them back — so prefer the commitment, and never match on an empty string.
-export async function markNoteSpentByIdentity(account: string, note: ShieldedNote): Promise<void> {
+export async function markNoteSpentByIdentity(
+  account: string,
+  note: ShieldedNote,
+  network?: NoteNetwork
+): Promise<void> {
+  const net = network ?? noteNetwork(note)
   if (note.commitment) {
-    await markNoteSpentByCommitment(account, note.commitment)
+    await markNoteSpentByCommitment(account, note.commitment, net)
   } else if (note.signature) {
-    await markNoteSpent(account, note.signature)
+    await markNoteSpent(account, note.signature, net)
   }
   // A note with neither identity cannot be addressed; leaving it is safe (the
   // on-chain nullifier set is the authoritative double-spend gate) and is not
@@ -134,8 +185,11 @@ export async function markNoteSpentByIdentity(account: string, note: ShieldedNot
 // their `amount` is in the token's own base units (e.g. 6-decimal USDC), so
 // summing them as lamports would corrupt the SOL figure. A note is native iff
 // it carries no `mint`. Use shieldedTokenBalances() for the SPL side.
-export async function shieldedBalance(account: string): Promise<bigint> {
-  const notes = await getNotes(account)
+export async function shieldedBalance(
+  account: string,
+  network: NoteNetwork = DEFAULT_NOTE_NETWORK
+): Promise<bigint> {
+  const notes = await getNotes(account, network)
   return notes
     .filter((n) => !n.spent && !n.mint)
     .reduce((sum, n) => sum + BigInt(n.amount), 0n)
@@ -144,9 +198,10 @@ export async function shieldedBalance(account: string): Promise<bigint> {
 // Unspent shielded SPL balances keyed by base58 mint (#779). Each amount is in
 // that mint's own base units, kept separate from the native lamports sum.
 export async function shieldedTokenBalances(
-  account: string
+  account: string,
+  network: NoteNetwork = DEFAULT_NOTE_NETWORK
 ): Promise<Record<string, bigint>> {
-  const notes = await getNotes(account)
+  const notes = await getNotes(account, network)
   const byMint: Record<string, bigint> = {}
   for (const n of notes) {
     if (n.spent || !n.mint) continue

@@ -125,22 +125,30 @@ export interface V3Leaf {
 // Transact line. `getSignaturesForAddress(programId)` only selects the tx, not
 // the emitter. Track the invoke/success stack and keep a `Program data:` line
 // only while our program is the one currently executing (top of stack).
-function eventPayloads(logs: string[], expectedProgramId: string): Uint8Array[] {
+export function eventPayloads(logs: string[], expectedProgramId: string): Uint8Array[] {
   const out: Uint8Array[] = []
-  const stack: string[] = []
+  const stack: { programId: string; payloads: Uint8Array[] }[] = []
   for (const line of logs) {
     const invoke = line.match(/^Program (\S+) invoke \[\d+\]$/)
     if (invoke) {
-      stack.push(invoke[1])
+      stack.push({ programId: invoke[1], payloads: [] })
       continue
     }
-    if (/^Program \S+ (success|failed)/.test(line)) {
-      stack.pop()
+    const exit = line.match(/^Program (\S+) (success|failed)(?:: .*)?$/)
+    if (exit) {
+      const top = stack[stack.length - 1]
+      if (top && top.programId === exit[1]) {
+        stack.pop()
+        if (exit[2] === "success" && top.programId === expectedProgramId) {
+          out.push(...top.payloads)
+        }
+      }
       continue
     }
     const data = line.match(/^Program data: (.+)$/)
-    if (data && stack[stack.length - 1] === expectedProgramId) {
-      out.push(Uint8Array.from(Buffer.from(data[1], "base64")))
+    const top = stack[stack.length - 1]
+    if (data && top && top.programId === expectedProgramId) {
+      top.payloads.push(Uint8Array.from(Buffer.from(data[1], "base64")))
     }
   }
   return out

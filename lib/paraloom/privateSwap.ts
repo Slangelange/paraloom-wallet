@@ -630,6 +630,23 @@ export async function privateSwapFromToken(
       params.outputMint,
       onReshielded
     )
+    // Sweep the unused self-funded gas SOL remainder back into the shielded pool
+    // after the SPL re-shield completes, matching the GAS_LAMPORTS contract.
+    try {
+      const solBal = BigInt(await connection.getBalance(fresh.publicKey))
+      const reshieldLamports = solBal - RESHIELD_FEE_RESERVE
+      if (reshieldLamports > 0n) {
+        await depositV3(
+          connection,
+          { secretKey: fresh.secretKey },
+          shieldedAddress,
+          spendPrivkeyHex,
+          reshieldLamports
+        )
+      }
+    } catch {
+      // best-effort: the swapped SPL token is already re-shielded/persisted
+    }
   }
 
   return {

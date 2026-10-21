@@ -16,12 +16,25 @@ import {
 
 import { NATIVE_ASSET_HEX } from "~lib/prover"
 import { encryptNote } from "./noteCrypto"
+import { RPC_URLS } from "./constants"
 import {
   addNote,
+  DEFAULT_NOTE_NETWORK,
+  markNoteSpentByCommitment,
   markNoteSpentByIdentity,
+  noteNetwork,
   setNoteLeafIndex,
+  type NoteNetwork,
   type ShieldedNote
 } from "./notes"
+
+export function inferNetworkFromConnection(connection: Connection): NoteNetwork {
+  const endpoint = (connection as { rpcEndpoint?: string } | undefined)?.rpcEndpoint ?? ""
+  if (endpoint === RPC_URLS.devnet || endpoint.toLowerCase().includes("devnet")) {
+    return "devnet"
+  }
+  return DEFAULT_NOTE_NETWORK
+}
 import { confirmCommitmentInTree } from "./settlementConfirm"
 import { fetchV3Leaves, sendDepositNote, submitTransact } from "./transact"
 
@@ -68,7 +81,8 @@ export async function depositV3(
   wallet: { secretKey: Uint8Array },
   shieldedAddress: string,
   spendPrivkeyHex: string,
-  lamports: bigint
+  lamports: bigint,
+  network: NoteNetwork = inferNetworkFromConnection(connection)
 ): Promise<{ signature: string; leafIndex: number }> {
   const blindingHex = randomHex32()
   const pubkeyHex = await v3NotePubkey(spendPrivkeyHex)
@@ -94,16 +108,21 @@ export async function depositV3(
     // the leaf by commitment, so the note is spendable even if the flow is
     // interrupted right here.
     async (sig) => {
-      await addNote(shieldedAddress, {
-        amount: lamports.toString(),
-        blinding: blindingHex,
-        assetId: NATIVE_ASSET_HEX,
-        signature: sig,
-        createdAt: Date.now(),
-        spent: false,
-        source: "deposit",
-        commitment
-      })
+      await addNote(
+        shieldedAddress,
+        {
+          amount: lamports.toString(),
+          blinding: blindingHex,
+          assetId: NATIVE_ASSET_HEX,
+          signature: sig,
+          createdAt: Date.now(),
+          spent: false,
+          source: "deposit",
+          commitment,
+          network
+        },
+        network
+      )
     }
   )
 
@@ -130,7 +149,7 @@ export async function depositV3(
 
   // Finalize the persisted note with its now-known leaf index, saving
   // ensureLeafIndex a full-history rebuild at spend time.
-  await setNoteLeafIndex(shieldedAddress, commitment, leafIndex)
+  await setNoteLeafIndex(shieldedAddress, commitment, leafIndex, network)
   return { signature, leafIndex }
 }
 
@@ -180,6 +199,50 @@ export interface SpendOptions {
   /// recipient-balance poll it already runs; when omitted (a shielded transfer),
   /// spendV3 falls back to watching the output commitment land in the tree.
   confirmSettled?: () => Promise<boolean>
+  /// Solana cluster whose tree and note store this spend targets.
+  network?: NoteNetwork
+}
+
+// Drop phantom notes before selection on `network`. Notes belonging to another
+// cluster are excluded up front and never marked spent against this cluster's
+// on-chain tree.
+export async function dropPhantomNotes(
+  connection: Connection,
+  account: string,
+  notes: ShieldedNote[],
+  network: NoteNetwork = inferNetworkFromConnection(connection)
+): Promise<ShieldedNote[]> {
+  const GRACE_MS = 120_000
+  const clusterNotes = notes.filter((n) => noteNetwork(n) === network)
+  const suspects = clusterNotes.filter(
+    (n) =>
+      n.leafIndex === undefined &&
+      !!n.commitment &&
+      Date.now() - n.createdAt > GRACE_MS
+  )
+  if (suspects.length === 0) return clusterNotes
+
+  let onchain: Set<string>
+  try {
+    const leaves = await fetchV3Leaves(connection)
+    onchain = new Set(leaves.map((l) => l.commitmentHex))
+  } catch {
+    return clusterNotes // cannot rebuild the tree safely — drop nothing
+  }
+
+  const dropped = new Set<string>()
+  for (const n of suspects) {
+    if (n.commitment && !onchain.has(n.commitment)) {
+      await markNoteSpentByCommitment(account, n.commitment, network)
+      dropped.add(n.commitment)
+    }
+  }
+  if (dropped.size > 0) {
+    console.log(
+      `[paraloom] reconciled ${dropped.size} phantom note(s) not present on-chain`
+    )
+  }
+  return clusterNotes.filter((n) => !(n.commitment && dropped.has(n.commitment)))
 }
 
 /// Spend 1–2 notes through the unified transact:
@@ -201,6 +264,10 @@ export async function spendV3(
 ): Promise<SpendResult> {
   if (inputs.length < 1 || inputs.length > 2) {
     throw new Error("transact spends 1 or 2 notes")
+  }
+  const targetNetwork = opts.network ?? inferNetworkFromConnection(connection)
+  if (inputs.some((n) => noteNetwork(n) !== targetNetwork)) {
+    throw new Error("cannot spend notes from a different network")
   }
   const sumIn = inputs.reduce((acc, n) => acc + BigInt(n.amount), 0n)
   if (payLamports <= 0n || payLamports > sumIn) {
@@ -366,20 +433,25 @@ export async function spendV3(
     // a fresh rebuild at spend time, which is authoritative. (Deposit notes keep
     // their index because it comes from the on-chain event and never moves.)
     for (const note of inputs) {
-      await markNoteSpentByIdentity(shieldedAddress, note)
+      await markNoteSpentByIdentity(shieldedAddress, note, targetNetwork)
     }
     if (change > 0n) {
-      await addNote(shieldedAddress, {
-        amount: change.toString(),
-        blinding: changeBlind,
-        assetId: assetIdHex,
-        mint: isSpl ? inputs[0].mint : undefined,
-        signature: "",
-        createdAt: Date.now(),
-        spent: false,
-        source: "transfer",
-        commitment: await noteCommitment(change, ownPubHex, changeBlind)
-      })
+      await addNote(
+        shieldedAddress,
+        {
+          amount: change.toString(),
+          blinding: changeBlind,
+          assetId: assetIdHex,
+          mint: isSpl ? inputs[0].mint : undefined,
+          signature: "",
+          createdAt: Date.now(),
+          spent: false,
+          source: "transfer",
+          commitment: await noteCommitment(change, ownPubHex, changeBlind),
+          network: targetNetwork
+        },
+        targetNetwork
+      )
     }
   }
 

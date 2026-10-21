@@ -13,7 +13,7 @@ import {
 } from "~lib/prover"
 import { TRANSACT_INGRESS_URL } from "./constants"
 import { tryDecryptNote } from "./noteCrypto"
-import { addDiscoveredNote, getNotes } from "./notes"
+import { addDiscoveredNote, DEFAULT_NOTE_NETWORK, getNotes, type NoteNetwork } from "./notes"
 
 interface DeliveredNote {
   output_commitment: string
@@ -94,7 +94,8 @@ async function verifiedMint(
 export async function scanForNotes(
   account: string,
   boxSecretKey: Uint8Array,
-  spendPrivkeyHex: string
+  spendPrivkeyHex: string,
+  network: NoteNetwork = DEFAULT_NOTE_NETWORK
 ): Promise<number> {
   const res = await fetch(`${TRANSACT_INGRESS_URL}/transact/scan`)
   if (!res.ok) {
@@ -103,7 +104,7 @@ export async function scanForNotes(
   const delivered = (await res.json()) as DeliveredNote[]
 
   const known = new Set(
-    (await getNotes(account)).map((n) => n.commitment).filter(Boolean) as string[]
+    (await getNotes(account, network)).map((n) => n.commitment).filter(Boolean) as string[]
   )
   const spendPubHex = await v3NotePubkey(spendPrivkeyHex)
 
@@ -137,17 +138,22 @@ export async function scanForNotes(
     if (mint === REJECT) {
       continue
     }
-    await addDiscoveredNote(account, {
-      amount: note.amount.toString(),
-      blinding: note.blindingHex,
-      assetId: note.assetIdHex,
-      mint,
-      signature: "",
-      createdAt: Date.now(),
-      spent: false,
-      commitment: d.output_commitment,
-      source: "transfer"
-    })
+    await addDiscoveredNote(
+      account,
+      {
+        amount: note.amount.toString(),
+        blinding: note.blindingHex,
+        assetId: note.assetIdHex,
+        mint,
+        signature: "",
+        createdAt: Date.now(),
+        spent: false,
+        commitment: d.output_commitment,
+        source: "transfer",
+        network
+      },
+      network
+    )
     // Track it here too: the same commitment can appear twice in one response,
     // and `known` is otherwise only a snapshot from before the loop, so the
     // note would be stored once but counted twice.

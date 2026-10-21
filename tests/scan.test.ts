@@ -459,4 +459,13 @@ describe("ordinary scanning", () => {
     respondWith([])
     expect(await scan()).toBe(0)
   })
+
+  it("isolates scanned notes per cluster (mainnet-beta vs devnet)", async () => {
+    respondWith([honest(750n)])
+    expect(await scanForNotes(ACCOUNT, ourBox.secretKey, SPEND_PRIVKEY, "devnet")).toBe(1)
+
+    expect(await shieldedBalance(ACCOUNT, "devnet")).toBe(750n)
+    expect(await shieldedBalance(ACCOUNT, "mainnet-beta")).toBe(0n)
+    expect((await getNotes(ACCOUNT, "devnet"))[0].network).toBe("devnet")
+  })
 })

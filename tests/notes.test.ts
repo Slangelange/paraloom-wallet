@@ -2,7 +2,9 @@ import {
   addDiscoveredNote,
   addNote,
   getNotes,
+  markNoteSpentByCommitment,
   markNoteSpentByIdentity,
+  setNoteLeafIndex,
   shieldedBalance,
   shieldedTokenBalances,
   type ShieldedNote
@@ -198,5 +200,57 @@ describe("note storage", () => {
     await addNote(ACCOUNT, deposit({ signature: "s1" }))
     await addNote(ACCOUNT, deposit({ signature: "s2", spent: true }))
     expect(await shieldedBalance(ACCOUNT)).toBe(1000n)
+  })
+})
+
+describe("cross-cluster note isolation (mainnet-beta vs devnet)", () => {
+  const USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+
+  it("isolates devnet deposits and balances from mainnet-beta", async () => {
+    await addNote(ACCOUNT, deposit({ signature: "sig-main", amount: "1000", network: "mainnet-beta" }))
+    await addNote(ACCOUNT, deposit({ signature: "sig-dev", amount: "5000000000", network: "devnet", leafIndex: 0 }))
+
+    expect(await shieldedBalance(ACCOUNT)).toBe(1000n)
+    expect(await shieldedBalance(ACCOUNT, "mainnet-beta")).toBe(1000n)
+    expect(await shieldedBalance(ACCOUNT, "devnet")).toBe(5000000000n)
+
+    const mainnetNotes = await getNotes(ACCOUNT, "mainnet-beta")
+    expect(mainnetNotes).toHaveLength(1)
+    expect(mainnetNotes[0].signature).toBe("sig-main")
+  })
+
+  it("isolates devnet SPL token notes from mainnet-beta token balances", async () => {
+    await addNote(ACCOUNT, deposit({ signature: "s-main", mint: USDC, amount: "500", network: "mainnet-beta" }))
+    await addNote(ACCOUNT, deposit({ signature: "s-dev", mint: USDC, amount: "999999", network: "devnet" }))
+
+    expect(await shieldedTokenBalances(ACCOUNT, "mainnet-beta")).toEqual({ [USDC]: 500n })
+    expect(await shieldedTokenBalances(ACCOUNT, "devnet")).toEqual({ [USDC]: 999999n })
+  })
+
+  it("does not mark a devnet transfer note spent when mainnet phantom-note reconciliation runs", async () => {
+    const devnetTransfer = received("dd".repeat(32), { amount: "2500", network: "devnet" })
+    await addDiscoveredNote(ACCOUNT, devnetTransfer, "devnet")
+
+    // Mainnet phantom-note reconciliation marks absent commitments spent on mainnet-beta:
+    await markNoteSpentByCommitment(ACCOUNT, devnetTransfer.commitment!, "mainnet-beta")
+
+    const devNotes = await getNotes(ACCOUNT, "devnet")
+    expect(devNotes).toHaveLength(1)
+    expect(devNotes[0].spent).toBe(false)
+    expect(await shieldedBalance(ACCOUNT, "devnet")).toBe(2500n)
+  })
+
+  it("scopes setNoteLeafIndex and markNoteSpentByIdentity to the note cluster", async () => {
+    const comm = "ee".repeat(32)
+    await addNote(ACCOUNT, deposit({ signature: "s1", commitment: comm, network: "mainnet-beta" }))
+    await addNote(ACCOUNT, deposit({ signature: "s2", commitment: comm, network: "devnet" }))
+
+    await setNoteLeafIndex(ACCOUNT, comm, 7, "devnet")
+    expect((await getNotes(ACCOUNT, "mainnet-beta"))[0].leafIndex).toBeUndefined()
+    expect((await getNotes(ACCOUNT, "devnet"))[0].leafIndex).toBe(7)
+
+    await markNoteSpentByIdentity(ACCOUNT, deposit({ signature: "s2", commitment: comm, network: "devnet" }))
+    expect((await getNotes(ACCOUNT, "mainnet-beta"))[0].spent).toBe(false)
+    expect((await getNotes(ACCOUNT, "devnet"))[0].spent).toBe(true)
   })
 })

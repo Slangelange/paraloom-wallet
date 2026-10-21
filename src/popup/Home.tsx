@@ -300,7 +300,8 @@ export function Home({ onLock }: HomeProps) {
       await scanForNotes(
         wallet.shieldedAddress,
         boxSecret,
-        Buffer.from(wallet.spendPrivkey).toString("hex")
+        Buffer.from(wallet.spendPrivkey).toString("hex"),
+        network
       )
     } catch {
       // transfer node down / no scan endpoint — ignore
@@ -311,7 +312,7 @@ export function Home({ onLock }: HomeProps) {
     // it always fires when the wallet is opened, and the reads below then reflect
     // the recovered shielded balance.
     try {
-      await recoverReshields(getConnection(network), wallet.shieldedAddress)
+      await recoverReshields(getConnection("mainnet-beta"), wallet.shieldedAddress)
     } catch {
       // best-effort — the reads below still show whatever is already local
     }
@@ -332,9 +333,9 @@ export function Home({ onLock }: HomeProps) {
       // best-effort
     }
     try {
-      setShieldedLamports(await shieldedBalance(wallet.shieldedAddress))
-      setShieldedTokens(await shieldedTokenBalances(wallet.shieldedAddress))
-      setNotes((await getNotes(wallet.shieldedAddress)).slice().reverse())
+      setShieldedLamports(await shieldedBalance(wallet.shieldedAddress, network))
+      setShieldedTokens(await shieldedTokenBalances(wallet.shieldedAddress, network))
+      setNotes((await getNotes(wallet.shieldedAddress, network)).slice().reverse())
     } catch {
       // storage read failed — ignore
     }
@@ -1046,7 +1047,7 @@ export function Home({ onLock }: HomeProps) {
                                   sym: depSym,
                                   address: "",
                                   signature: n.signature,
-                                  explorerUrl: `https://explorer.solana.com/tx/${n.signature}?cluster=${network}`,
+                                  explorerUrl: `https://explorer.solana.com/tx/${n.signature}?cluster=${n.network ?? network}`,
                                   createdAt: n.createdAt
                                 })
                               }
