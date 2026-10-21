@@ -108,7 +108,8 @@ export async function reconcileSwapOutputs(
           await saveSwapOutput({
             ...o,
             outAmount: r.outAmount,
-            swapSignature: r.swapSignature
+            swapSignature: r.swapSignature,
+            ...(r.reshielded ? { reshield: true, reshieldRecovered: true } : {})
           })
           if (r.reshielded) {
             await persistReshieldedNote(shieldedAddress, r.reshielded)

@@ -29,7 +29,7 @@ import { assetIdForMint } from "~lib/prover"
 import { associatedTokenAddress, createTokenAccount, depositSpl } from "./bridge"
 import { SWAP_ROUTER_URL } from "./constants"
 import type { ShieldedNote } from "./notes"
-import { saveSwapOutput } from "./swapOutputs"
+import { dismissSwapOutput, saveSwapOutput } from "./swapOutputs"
 import { depositV3, spendV3 } from "./transactFlow"
 
 import { WSOL_MINT, isNativeSolOutput } from "./swapReconcileClassify"
@@ -391,6 +391,7 @@ export async function privateSwap(
     outputMint: params.outputMint,
     outAmount: out_amount,
     swapSignature,
+    reshield: params.reshield ?? false,
     createdAt: Date.now()
   })
 
@@ -413,6 +414,18 @@ export async function privateSwap(
       params.outputMint,
       onReshielded
     )
+    if (reshielded) {
+      await saveSwapOutput({
+        freshAddress: fresh.publicKey.toBase58(),
+        freshSecretKeyHex: Buffer.from(fresh.secretKey).toString("hex"),
+        outputMint: params.outputMint,
+        outAmount: out_amount,
+        swapSignature,
+        reshield: true,
+        reshieldRecovered: true,
+        createdAt: Date.now()
+      })
+    }
   }
 
   return {
@@ -540,39 +553,68 @@ export async function privateSwapFromToken(
     )
   }
 
-  // 2. Create the input-mint ATA at the fresh address (paid from the gas SOL).
-  //    The on-chain transact_spl withdraw transfers into an EXISTING account.
-  await createTokenAccount(connection, fresh, fresh.publicKey, inputMintPk)
-
-  // 3. Withdraw the shielded token note(s) INTO that ATA — the circuit recipient
-  //    is the token account, not the wallet address. The token notes are marked
-  //    spent only once the ATA is funded (paraloom-core#792).
-  const ataHex = Buffer.from(ata.toBytes()).toString("hex")
+  // 2. Create the input-mint ATA at the fresh address (paid from the gas SOL)
+  //    and withdraw the shielded token note(s) INTO that ATA. If either step
+  //    fails before any input token lands, sweep the self-funded gas SOL back
+  //    into the shielded pool so failed/retried swaps do not orphan ~0.0069–
+  //    0.00897 SOL at `fresh` or leave a funded pending row that
+  //    reconcileSwapOutputs misclassifies as a SOL swap.
+  let requestId = ""
   let tokenLanded = 0n
-  const { requestId, settled } = await spendV3(
-    connection,
-    shieldedAddress,
-    spendPrivkeyHex,
-    ownBoxPubHex,
-    tokenInputs,
-    params.amountTokenUnits,
-    { kind: "withdraw", recipientSolanaHex: ataHex },
-    {
-      ingressToken,
-      confirmSettled: async () => {
-        try {
-          tokenLanded = await waitForTokenFunding(connection, ata)
-          return true
-        } catch {
-          return false
+  try {
+    await createTokenAccount(connection, fresh, fresh.publicKey, inputMintPk)
+
+    // 3. Withdraw the shielded token note(s) INTO that ATA — the circuit recipient
+    //    is the token account, not the wallet address. The token notes are marked
+    //    spent only once the ATA is funded (paraloom-core#792).
+    const ataHex = Buffer.from(ata.toBytes()).toString("hex")
+    const tokenSpend = await spendV3(
+      connection,
+      shieldedAddress,
+      spendPrivkeyHex,
+      ownBoxPubHex,
+      tokenInputs,
+      params.amountTokenUnits,
+      { kind: "withdraw", recipientSolanaHex: ataHex },
+      {
+        ingressToken,
+        confirmSettled: async () => {
+          try {
+            tokenLanded = await waitForTokenFunding(connection, ata)
+            return true
+          } catch {
+            return false
+          }
         }
       }
-    }
-  )
-  if (!settled) {
-    throw new Error(
-      "token withdraw did not settle in time; the spent notes remain spendable, reopen the wallet to retry"
     )
+    requestId = tokenSpend.requestId
+    if (!tokenSpend.settled) {
+      throw new Error(
+        "token withdraw did not settle in time; the spent notes remain spendable, reopen the wallet to retry"
+      )
+    }
+  } catch (err) {
+    if (tokenLanded <= 0n) {
+      try {
+        const solBal = BigInt(await connection.getBalance(fresh.publicKey))
+        const refundLamports = solBal - RESHIELD_FEE_RESERVE
+        if (refundLamports > 0n) {
+          await depositV3(
+            connection,
+            { secretKey: fresh.secretKey },
+            shieldedAddress,
+            spendPrivkeyHex,
+            refundLamports
+          )
+          await dismissSwapOutput(fresh.publicKey.toBase58())
+        }
+      } catch {
+        // Keep the saved SwapOutput (and freshSecretKeyHex) intact if the gas
+        // refund deposit fails, so the ephemeral key is never lost.
+      }
+    }
+    throw err
   }
 
   // 4. Route the ACTUAL landed token amount (net of the withdraw fee) into the
@@ -597,6 +639,7 @@ export async function privateSwapFromToken(
     outputMint: params.outputMint,
     outAmount: out_amount,
     swapSignature,
+    reshield: params.reshield ?? false,
     createdAt: Date.now()
   })
   await waitForSwapConfirmation(connection, swapSignature)
@@ -606,6 +649,7 @@ export async function privateSwapFromToken(
   //    itself). Best-effort: on failure the output stays at the fresh address as
   //    a private buy, recoverable with its saved key.
   let reshielded: ReshieldedNote | undefined
+  let reshieldDone = false
   if (params.reshield && isNativeSolOutput(params.outputMint)) {
     try {
       const solBal = BigInt(await connection.getBalance(fresh.publicKey))
@@ -618,6 +662,7 @@ export async function privateSwapFromToken(
           spendPrivkeyHex,
           reshieldLamports
         )
+        reshieldDone = true
       }
     } catch {
       // leave the swapped SOL as a private buy at the fresh address
@@ -630,6 +675,20 @@ export async function privateSwapFromToken(
       params.outputMint,
       onReshielded
     )
+    if (reshielded) reshieldDone = true
+  }
+
+  if (reshieldDone) {
+    await saveSwapOutput({
+      freshAddress: fresh.publicKey.toBase58(),
+      freshSecretKeyHex: Buffer.from(fresh.secretKey).toString("hex"),
+      outputMint: params.outputMint,
+      outAmount: out_amount,
+      swapSignature,
+      reshield: true,
+      reshieldRecovered: true,
+      createdAt: Date.now()
+    })
   }
 
   return {
@@ -684,7 +743,7 @@ export async function resumeSwapAtFreshAddress(
   )
 
   let reshielded: ReshieldedNote | undefined
-  if (reshield && outputMint !== "SOL") {
+  if (reshield && !isNativeSolOutput(outputMint)) {
     reshielded = await reshieldToken(
       connection,
       fresh,
