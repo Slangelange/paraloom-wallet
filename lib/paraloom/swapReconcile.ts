@@ -18,16 +18,19 @@
 //                 cannot positively account for, so a transient RPC blip can never
 //                 hide a genuinely recoverable strand.
 
-import { Connection, PublicKey } from "@solana/web3.js"
+import { Connection, Keypair, PublicKey } from "@solana/web3.js"
 
 import { isNativeSolOutput, resumeSwapAtFreshAddress } from "./privateSwap"
 import { persistReshieldedNote } from "./reshieldRecovery"
 import {
   classifyStrand,
+  isSubReserveRecoverableSol,
+  RESHIELD_FEE_RESERVE_LAMPORTS,
   RESUME_GRACE_MS,
   RESUME_MIN_LAMPORTS
 } from "./swapReconcileClassify"
 import { listSwapOutputs, saveSwapOutput } from "./swapOutputs"
+import { depositV3 } from "./transactFlow"
 
 export { classifyStrand, RESUME_GRACE_MS, RESUME_MIN_LAMPORTS }
 export type { StrandAction } from "./swapReconcileClassify"
@@ -39,7 +42,8 @@ let reconcileInFlight = false
 /// left as-is. Returns the number of rows it moved out of the pending state.
 export async function reconcileSwapOutputs(
   connection: Connection,
-  shieldedAddress: string
+  shieldedAddress: string,
+  spendPrivkeyHex?: string
 ): Promise<number> {
   if (reconcileInFlight) return 0
   reconcileInFlight = true
@@ -103,7 +107,8 @@ export async function reconcileSwapOutputs(
             o.freshSecretKeyHex,
             o.outputMint,
             o.reshield ?? false,
-            (note) => persistReshieldedNote(shieldedAddress, note)
+            (note) => persistReshieldedNote(shieldedAddress, note),
+            spendPrivkeyHex
           )
           await saveSwapOutput({
             ...o,
@@ -140,6 +145,43 @@ export async function reconcileSwapOutputs(
         } catch (e) {
           console.log(
             `[paraloom] could not record landed swap at ${o.freshAddress}: ${
+              e instanceof Error ? e.message : String(e)
+            }`
+          )
+        }
+      } else if (
+        action === "unresolved" &&
+        spendPrivkeyHex &&
+        isSubReserveRecoverableSol(solLamports, tokenAmount)
+      ) {
+        try {
+          // The fresh address holds withdrawn SOL that is at or below the
+          // 0.006 SOL swap overhead reserve (so the swap leg cannot execute),
+          // but above the 0.001 SOL re-shield fee reserve. Sweep it back into
+          // the user's shielded pool so the funds are not stranded or lost if
+          // the row is dismissed.
+          const fresh = Keypair.fromSecretKey(
+            Uint8Array.from(Buffer.from(o.freshSecretKeyHex, "hex"))
+          )
+          const reshieldLamports = solLamports - RESHIELD_FEE_RESERVE_LAMPORTS
+          if (reshieldLamports > 0n) {
+            const dep = await depositV3(
+              connection,
+              { secretKey: fresh.secretKey },
+              shieldedAddress,
+              spendPrivkeyHex,
+              reshieldLamports
+            )
+            await saveSwapOutput({
+              ...o,
+              swapSignature: dep.signature,
+              reshieldRecovered: true
+            })
+            resolved++
+          }
+        } catch (e) {
+          console.log(
+            `[paraloom] could not sweep sub-reserve SOL at ${o.freshAddress}: ${
               e instanceof Error ? e.message : String(e)
             }`
           )

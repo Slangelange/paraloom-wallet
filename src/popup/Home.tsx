@@ -323,7 +323,8 @@ export function Home({ onLock }: HomeProps) {
     try {
       const resolved = await reconcileSwapOutputs(
         getConnection("mainnet-beta"),
-        wallet.shieldedAddress
+        wallet.shieldedAddress,
+        Buffer.from(wallet.spendPrivkey).toString("hex")
       )
       if (resolved > 0) {
         listSwapOutputs().then(setSwapOutputs).catch(() => {})

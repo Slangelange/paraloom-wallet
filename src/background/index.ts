@@ -14,10 +14,14 @@ import {
 import { fetchV3Leaves } from "~lib/paraloom/transact"
 import {
   GAS_LAMPORTS,
+  MIN_SOL_SWAP_WITHDRAW_LAMPORTS,
+  expectedNetWithdrawLamports,
+  isNativeSolOutput,
   privateSwap,
   privateSwapFromToken,
   type ReshieldedNote
 } from "~lib/paraloom/privateSwap"
+import { SWAP_OVERHEAD_LAMPORTS } from "~lib/paraloom/swapReconcileClassify"
 import { persistReshieldedNote, recoverReshields } from "~lib/paraloom/reshieldRecovery"
 import { reconcileSwapOutputs } from "~lib/paraloom/swapReconcile"
 import { assetIdForMint, NATIVE_ASSET_HEX } from "~lib/prover"
@@ -416,9 +420,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const session = await loadSession()
         if (!session) return sendResponse({ success: false, error: "locked" })
         const connection = new Connection(PRIVATE_SWAP_RPC_URL, "confirmed")
+        const spendPrivkeyHex = Buffer.from(session.wallet.spendPrivkey).toString("hex")
         const recovered = await reconcileSwapOutputs(
           connection,
-          session.wallet.shieldedAddress
+          session.wallet.shieldedAddress,
+          spendPrivkeyHex
         )
         const reshielded = await recoverReshields(
           connection,
@@ -859,7 +865,7 @@ async function handlePrivateSwap(
   // gas withdraw was even submitted. It already runs on connect (resumeSwaps)
   // and is guarded against double-runs; the new swap uses its own fresh address,
   // so a concurrent background reconcile cannot conflict with it.
-  void reconcileSwapOutputs(connection, shieldedAddress).catch(() => 0)
+  void reconcileSwapOutputs(connection, shieldedAddress, spendPrivkeyHex).catch(() => 0)
   void recoverReshields(connection, shieldedAddress).catch(() => 0)
 
   // Token-input swap (e.g. USDC -> SOL): spend a shielded SPL note and self-fund
@@ -920,6 +926,16 @@ async function handlePrivateSwap(
         reshielded: tokenResult.reshielded !== undefined
       }
     }
+  }
+
+  if (isNativeSolOutput(params.outputMint)) {
+    throw new Error("outputMint cannot be native SOL for a SOL-input swap")
+  }
+  const expectedNet = expectedNetWithdrawLamports(amount)
+  if (expectedNet <= SWAP_OVERHEAD_LAMPORTS) {
+    throw new Error(
+      `amount nets ${Number(expectedNet) / 1e9} SOL after the protocol withdrawal fee, which is at or below the 0.006 SOL swap overhead reserve (minimum ${Number(MIN_SOL_SWAP_WITHDRAW_LAMPORTS) / 1e9} SOL)`
+    )
   }
 
   const candidates = (await getNotes(shieldedAddress)).filter(

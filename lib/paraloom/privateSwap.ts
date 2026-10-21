@@ -32,8 +32,20 @@ import type { ShieldedNote } from "./notes"
 import { saveSwapOutput } from "./swapOutputs"
 import { depositV3, spendV3 } from "./transactFlow"
 
-import { WSOL_MINT, isNativeSolOutput } from "./swapReconcileClassify"
-export { WSOL_MINT, isNativeSolOutput }
+import {
+  MIN_SOL_SWAP_WITHDRAW_LAMPORTS,
+  RESHIELD_FEE_RESERVE_LAMPORTS,
+  WSOL_MINT,
+  expectedNetWithdrawLamports,
+  isNativeSolOutput
+} from "./swapReconcileClassify"
+export {
+  MIN_SOL_SWAP_WITHDRAW_LAMPORTS,
+  RESHIELD_FEE_RESERVE_LAMPORTS,
+  WSOL_MINT,
+  expectedNetWithdrawLamports,
+  isNativeSolOutput
+}
 
 /** Lamports left at the fresh address to cover the swap's own costs: the output
  *  token ATA rent (~0.00204), the fresh account's rent-exempt floor (~0.00089),
@@ -302,6 +314,15 @@ export async function privateSwap(
   onReshielded?: (note: ReshieldedNote) => Promise<void>
 ): Promise<PrivateSwapResult> {
   if (params.amountLamports <= 0n) throw new Error("amount must be > 0")
+  if (isNativeSolOutput(params.outputMint)) {
+    throw new Error("outputMint cannot be native SOL for a SOL-input swap")
+  }
+  const expectedNet = expectedNetWithdrawLamports(params.amountLamports)
+  if (expectedNet <= SWAP_OVERHEAD_LAMPORTS) {
+    throw new Error(
+      `withdrawn ${Number(expectedNet) / Number(LAMPORTS_PER_SOL)} SOL after the protocol withdrawal fee is at or below the swap overhead reserve (minimum ${Number(MIN_SOL_SWAP_WITHDRAW_LAMPORTS) / Number(LAMPORTS_PER_SOL)} SOL)`
+    )
+  }
 
   // 1. Fresh ephemeral key — generated here, never sent anywhere.
   const fresh = Keypair.generate()
@@ -413,6 +434,14 @@ export async function privateSwap(
       params.outputMint,
       onReshielded
     )
+    if (reshielded) {
+      await sweepResidualSolToPool(
+        connection,
+        fresh,
+        shieldedAddress,
+        spendPrivkeyHex
+      )
+    }
   }
 
   return {
@@ -433,7 +462,34 @@ export async function privateSwap(
 export const GAS_LAMPORTS = 9_000_000n
 /** Left at the fresh address to pay the re-shield deposit tx when sweeping the
  *  swapped SOL back into the pool. */
-const RESHIELD_FEE_RESERVE = 1_000_000n
+const RESHIELD_FEE_RESERVE = RESHIELD_FEE_RESERVE_LAMPORTS
+
+// Best-effort sweep of unused overhead/gas SOL remaining at `fresh` back into
+// the shielded pool after a round-trip swap re-shield completes.
+async function sweepResidualSolToPool(
+  connection: Connection,
+  fresh: Keypair,
+  shieldedAddress: string,
+  spendPrivkeyHex: string
+): Promise<string | undefined> {
+  try {
+    const solBal = BigInt(await connection.getBalance(fresh.publicKey))
+    const reshieldLamports = solBal - RESHIELD_FEE_RESERVE
+    if (reshieldLamports > 0n) {
+      const dep = await depositV3(
+        connection,
+        { secretKey: fresh.secretKey },
+        shieldedAddress,
+        spendPrivkeyHex,
+        reshieldLamports
+      )
+      return dep.signature
+    }
+  } catch {
+    // Best-effort: leave residual SOL at the fresh address recoverable with its key
+  }
+  return undefined
+}
 
 // Poll an SPL token account until the withdrawn balance actually lands.
 async function waitForTokenFunding(
@@ -665,7 +721,8 @@ export async function resumeSwapAtFreshAddress(
   freshSecretKeyHex: string,
   outputMint: string,
   reshield: boolean,
-  onReshielded?: (note: ReshieldedNote) => Promise<void>
+  onReshielded?: (note: ReshieldedNote) => Promise<void>,
+  spendPrivkeyHex?: string
 ): Promise<ResumeSwapResult> {
   const fresh = Keypair.fromSecretKey(
     Uint8Array.from(Buffer.from(freshSecretKeyHex, "hex"))
@@ -684,7 +741,7 @@ export async function resumeSwapAtFreshAddress(
   )
 
   let reshielded: ReshieldedNote | undefined
-  if (reshield && outputMint !== "SOL") {
+  if (reshield && !isNativeSolOutput(outputMint)) {
     reshielded = await reshieldToken(
       connection,
       fresh,
@@ -692,6 +749,14 @@ export async function resumeSwapAtFreshAddress(
       outputMint,
       onReshielded
     )
+    if (reshielded && spendPrivkeyHex) {
+      await sweepResidualSolToPool(
+        connection,
+        fresh,
+        shieldedAddress,
+        spendPrivkeyHex
+      )
+    }
   }
 
   return { swapSignature, outAmount, reshielded }
